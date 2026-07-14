@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Auth Validation Schemas (Zod)
  * Date: 2026-07-10
  *
@@ -85,8 +85,29 @@ export const changePasswordSchema = z
     path:    ["newPassword"],
   })
 
+
+/** Used when the user requests a password reset link */
+export const forgotPasswordSchema = z.object({
+  email: emailField,
+})
+
+/** Used when resetting the password with a code */
+export const resetPasswordSchema = z
+  .object({
+    email: emailField,
+    code: z.string().min(1, "Verification code is required"),
+    password: passwordField,
+    confirmPassword: z.string().min(1, "Please confirm your password"),
+  })
+  .refine((data) => data.password === data.confirmPassword, {
+    message: "Passwords do not match",
+    path: ["confirmPassword"],
+  })
+
 // ── Inferred types ────────────────────────────────────────────
 
 export type LoginInput          = z.infer<typeof loginSchema>
 export type RegisterInput       = z.infer<typeof registerSchema>
 export type ChangePasswordInput = z.infer<typeof changePasswordSchema>
+export type ForgotPasswordInput = z.infer<typeof forgotPasswordSchema>
+export type ResetPasswordInput  = z.infer<typeof resetPasswordSchema>

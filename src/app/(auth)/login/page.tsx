@@ -81,6 +81,13 @@ export default function LoginPage() {
           </div>
         )}
 
+        {/* Success banner after password reset */}
+        {params.get("reset") === "1" && (
+          <div className="auth-banner auth-banner--success">
+            Password reset successful! Please sign in with your new password.
+          </div>
+        )}
+
         {/* Error banner */}
         {error && (
           <div className="auth-banner auth-banner--error" role="alert">

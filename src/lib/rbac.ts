@@ -63,7 +63,7 @@ const FINANCE_ROUTES = ["/finance"]
 const AUTHENTICATED_ROUTES = ["/dashboard", "/expenses", "/settings", "/transactions", "/insights", "/categories"]
 
 /** Auth routes (redirect to dashboard if already logged in) */
-const AUTH_ROUTES = ["/login", "/register"]
+const AUTH_ROUTES = ["/login", "/register", "/forgot-password"]
 
 export function classifyRoute(pathname: string): {
   requiresAuth:    boolean

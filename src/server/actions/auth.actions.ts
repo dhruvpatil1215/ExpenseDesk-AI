@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Auth Server Actions
  * Date: 2026-07-10
  * Path: src/server/actions/auth.actions.ts
@@ -23,7 +23,7 @@ import { redirect } from "next/navigation"
 import { signIn, signOut } from "@/auth"
 import { prisma } from "@/lib/db"
 import { hashPassword } from "@/lib/password"
-import { registerSchema } from "@/lib/validators/auth.schema"
+import { registerSchema, forgotPasswordSchema, resetPasswordSchema } from "@/lib/validators/auth.schema"
 import { getDefaultRedirect } from "@/lib/rbac"
 import { Role } from "@/types/database"
 import { AuthError } from "next-auth"
@@ -185,4 +185,132 @@ export async function credentialsSignIn(formData: FormData): Promise<ActionResul
 export async function logoutUser(): Promise<void> {
   await signOut({ redirect: false })
   redirect("/login")
+}
+
+// ── requestPasswordReset ──────────────────────────────────────
+
+/**
+ * Checks if email exists. In a real app, it would email a reset token.
+ * In this demo/development app, it returns a mock code "123456" so the
+ * developer/user can reset it directly on screen.
+ */
+export async function requestPasswordReset(formData: FormData): Promise<ActionResult & { devCode?: string }> {
+  const email = formData.get("email") as string
+
+  const parsed = forgotPasswordSchema.safeParse({ email })
+  if (!parsed.success) {
+    return {
+      success: false,
+      error: "Please enter a valid email address.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    }
+  }
+
+  // Look up user in DB
+  const user = await prisma.user.findUnique({
+    where: { email: parsed.data.email },
+    select: { id: true, passwordHash: true }
+  })
+
+  if (!user) {
+    return {
+      success: false,
+      error: "No account found with this email address.",
+    }
+  }
+
+  // If the user signed in with Google, they don't have a local password to reset.
+  if (!user.passwordHash) {
+    return {
+      success: false,
+      error: "This account uses Google Sign-In. Please sign in with Google.",
+    }
+  }
+
+  // Audit log
+  await prisma.activityLog.create({
+    data: {
+      userId: user.id,
+      action: "auth.password_reset_request",
+      resourceType: "user",
+      resourceId: user.id,
+      metadata: { method: "forgot-password-page" },
+    },
+  })
+
+  return {
+    success: true,
+    devCode: "123456",
+  }
+}
+
+// ── resetPassword ─────────────────────────────────────────────
+
+/**
+ * Resets the password if the verification code matches.
+ */
+export async function resetPassword(formData: FormData): Promise<ActionResult> {
+  const email = formData.get("email") as string
+  const code = formData.get("code") as string
+  const password = formData.get("password") as string
+  const confirmPassword = formData.get("confirmPassword") as string
+
+  const parsed = resetPasswordSchema.safeParse({
+    email,
+    code,
+    password,
+    confirmPassword,
+  })
+
+  if (!parsed.success) {
+    return {
+      success: false,
+      error: "Please fix the errors below.",
+      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
+    }
+  }
+
+  // Verify the mock code
+  if (parsed.data.code !== "123456") {
+    return {
+      success: false,
+      error: "Invalid verification code. Use the demo code '123456'.",
+      fieldErrors: { code: ["Incorrect verification code."] },
+    }
+  }
+
+  // Hash new password
+  let passwordHash: string
+  try {
+    passwordHash = await hashPassword(parsed.data.password)
+  } catch {
+    return { success: false, error: "Failed to process password. Please try again." }
+  }
+
+  // Update user in DB
+  try {
+    const user = await prisma.user.update({
+      where: { email: parsed.data.email },
+      data: {
+        passwordHash,
+        failedLoginCount: 0,
+        lockedUntil: null,
+      },
+      select: { id: true },
+    })
+
+    // Audit log
+    await prisma.activityLog.create({
+      data: {
+        userId: user.id,
+        action: "auth.password_reset",
+        resourceType: "user",
+        resourceId: user.id,
+      },
+    })
+  } catch {
+    return { success: false, error: "Failed to reset password. Please try again." }
+  }
+
+  return { success: true }
 }
