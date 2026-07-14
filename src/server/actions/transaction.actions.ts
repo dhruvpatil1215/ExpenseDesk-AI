@@ -19,6 +19,7 @@
 import { revalidatePath } from "next/cache"
 import { prisma }         from "@/lib/db"
 import { requireAuth }    from "@/lib/session"
+import { genAI, GEMINI_MODEL } from "@/lib/ai/gemini"
 import {
   createTransactionSchema,
   updateTransactionSchema,
@@ -60,6 +61,8 @@ function serialize(t: {
   notes: string | null; transactionDate: Date; tags: string[]; status: string
   receiptUrl: string | null; isRecurring: boolean; transferToAccountId: string | null
   createdAt: Date; updatedAt: Date
+  rejectionReason: string | null
+  reimbursedAt: Date | null
   account: { name: string }
   category: { name: string; color: string | null; icon: string | null } | null
 }): SerializedTransaction {
@@ -85,6 +88,8 @@ function serialize(t: {
     transferToAccountId: t.transferToAccountId,
     createdAt:           t.createdAt.toISOString(),
     updatedAt:           t.updatedAt.toISOString(),
+    rejectionReason:     t.rejectionReason ?? null,
+    reimbursedAt:        t.reimbursedAt ? t.reimbursedAt.toISOString() : null,
   }
 }
 
@@ -112,6 +117,9 @@ export async function createTransaction(
   const {
     accountId, categoryId, type, amount, currency,
     description, notes, transactionDate, tags, transferToAccountId,
+    receiptUrl, receiptMimeType, submitForApproval,
+    aiRawVendor, aiRawAmount, aiRawDate, aiRawCategory,
+    aiConfidence, aiExtractionRaw
   } = parsed.data
 
   // Verify account belongs to this user
@@ -136,7 +144,16 @@ export async function createTransaction(
         transactionDate:     new Date(transactionDate),
         tags,
         transferToAccountId: transferToAccountId ?? null,
-        status:              "APPROVED",          // personal finance bypass
+        status:              submitForApproval ? "PENDING" : "APPROVED",
+        submittedAt:         submitForApproval ? new Date() : null,
+        receiptUrl:          receiptUrl ?? null,
+        receiptMimeType:     receiptMimeType ?? null,
+        aiRawVendor:         aiRawVendor ?? null,
+        aiRawAmount:         aiRawAmount ? BigInt(aiRawAmount) : null,
+        aiRawDate:           aiRawDate ? new Date(aiRawDate) : null,
+        aiRawCategory:       aiRawCategory ?? null,
+        aiConfidence:        aiConfidence ?? null,
+        aiExtractionRaw:     aiExtractionRaw ?? null,
       },
       include: INCLUDE,
     })
@@ -145,9 +162,11 @@ export async function createTransaction(
 
     revalidatePath("/transactions")
     revalidatePath("/dashboard")
+    revalidatePath("/approvals")
 
     return { success: true, data: serialize(tx) }
-  } catch {
+  } catch (error) {
+    console.error("[createTransaction] error:", error)
     return { success: false, error: "Failed to create transaction. Please try again." }
   }
 }
@@ -181,7 +200,7 @@ export async function updateTransaction(
     }
   }
 
-  const { amount, transactionDate, categoryId, transferToAccountId, ...rest } = parsed.data
+  const { amount, transactionDate, categoryId, transferToAccountId, submitForApproval, ...rest } = parsed.data
 
   try {
     const tx = await prisma.transaction.update({
@@ -192,6 +211,7 @@ export async function updateTransaction(
         ...(transactionDate !== undefined ? { transactionDate: new Date(transactionDate) } : {}),
         ...(categoryId      !== undefined ? { categoryId }                         : {}),
         ...(transferToAccountId !== undefined ? { transferToAccountId }            : {}),
+        ...(submitForApproval ? { status: "PENDING", submittedAt: new Date() } : {}),
       },
       include: INCLUDE,
     })
@@ -202,9 +222,11 @@ export async function updateTransaction(
 
     revalidatePath("/transactions")
     revalidatePath("/dashboard")
+    revalidatePath("/approvals")
 
     return { success: true, data: serialize(tx) }
-  } catch {
+  } catch (error) {
+    console.error("[updateTransaction] error:", error)
     return { success: false, error: "Failed to update transaction. Please try again." }
   }
 }
@@ -271,4 +293,222 @@ export async function bulkDeleteTransactions(
   revalidatePath("/dashboard")
 
   return { success: true, data: { deletedCount: count } }
+}
+
+// ── parseReceiptWithAI ────────────────────────────────────────
+
+const RECEIPT_SYSTEM_PROMPT = `
+You are an expert receipt parsing AI. Your job is to extract financial transaction information from the provided receipt image.
+You must return your response as a valid JSON object ONLY. Do not wrap the JSON in markdown code blocks or add any other text.
+The JSON must follow this exact schema:
+{
+  "vendor": string | null,      // Name of the store, merchant, or service provider
+  "amount": number | null,      // Total amount in rupees (floating number, e.g. 1250.50)
+  "date": string | null,        // Date of transaction in YYYY-MM-DD format
+  "category": string | null     // Choose the category name that best matches this receipt from: "Food & Dining", "Shopping", "Housing & Rent", "Transportation", "Utilities", "Uncategorized"
+  "confidence": number          // Overall confidence score from 0.0 to 1.0
+}
+`
+
+export async function parseReceiptWithAI(
+  base64Data: string,
+  mimeType: string
+): Promise<ActionResult<{
+  vendor: string | null
+  amount: number | null
+  date: string | null
+  categoryId: string | null
+  confidence: number
+}>> {
+  try {
+    const user = await requireAuth()
+
+    if (!base64Data) {
+      return { success: false, error: "No receipt file provided." }
+    }
+
+    // Call Gemini Model
+    const response = await genAI.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              inlineData: {
+                data: base64Data,
+                mimeType: mimeType,
+              },
+            },
+            {
+              text: "Extract vendor, amount, date, category and confidence from this receipt.",
+            },
+          ],
+        },
+      ],
+      config: {
+        systemInstruction: RECEIPT_SYSTEM_PROMPT,
+        responseMimeType: "application/json",
+        temperature: 0.1,
+      },
+    })
+
+    const text = response.text ?? ""
+    if (!text) {
+      return { success: false, error: "AI returned empty response." }
+    }
+
+    const cleaned = text
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/, "")
+      .trim()
+
+    const data = JSON.parse(cleaned)
+
+    // Lookup matched category ID
+    const categories = await prisma.category.findMany({
+      where: {
+        OR: [{ userId: user.id }, { userId: null }]
+      }
+    })
+
+    const matchedCategory = categories.find(
+      (c) => c.name.toLowerCase() === data.category?.toLowerCase()
+    ) || categories.find((c) => c.name === "Uncategorized") || categories[0]
+
+    return {
+      success: true,
+      data: {
+        vendor: data.vendor ?? null,
+        amount: data.amount ?? null,
+        date: data.date ?? null,
+        categoryId: matchedCategory?.id ?? null,
+        confidence: data.confidence ?? 0.5,
+      },
+    }
+  } catch (error) {
+    console.error("[parseReceiptWithAI] error:", error)
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Failed to parse receipt with AI.",
+    }
+  }
+}
+
+// ── approveTransaction ────────────────────────────────────────
+
+export async function approveTransaction(id: string): Promise<ActionResult> {
+  try {
+    const user = await requireAuth()
+
+    if (user.role !== "MANAGER") {
+      return { success: false, error: "Forbidden: Only managers can approve expenses." }
+    }
+
+    const existing = await prisma.transaction.findFirst({
+      where: { id, isDeleted: false, status: "PENDING" }
+    })
+    if (!existing) {
+      return { success: false, error: "Transaction not found or not pending." }
+    }
+
+    await prisma.transaction.update({
+      where: { id },
+      data: {
+        status: "APPROVED",
+        rejectionReason: null
+      }
+    })
+
+    audit(user.id, "transaction.approved", id, "transaction")
+
+    revalidatePath("/transactions")
+    revalidatePath("/approvals")
+    revalidatePath("/finance")
+
+    return { success: true }
+  } catch (error) {
+    console.error("[approveTransaction] error:", error)
+    return { success: false, error: "Failed to approve transaction." }
+  }
+}
+
+// ── rejectTransaction ─────────────────────────────────────────
+
+export async function rejectTransaction(id: string, reason: string): Promise<ActionResult> {
+  try {
+    const user = await requireAuth()
+
+    if (user.role !== "MANAGER") {
+      return { success: false, error: "Forbidden: Only managers can reject expenses." }
+    }
+
+    if (!reason || reason.trim().length < 10) {
+      return { success: false, error: "A rejection reason of at least 10 characters is required." }
+    }
+
+    const existing = await prisma.transaction.findFirst({
+      where: { id, isDeleted: false, status: "PENDING" }
+    })
+    if (!existing) {
+      return { success: false, error: "Transaction not found or not pending." }
+    }
+
+    await prisma.transaction.update({
+      where: { id },
+      data: {
+        status: "REJECTED",
+        rejectionReason: reason
+      }
+    })
+
+    audit(user.id, "transaction.rejected", id, "transaction", undefined, { reason })
+
+    revalidatePath("/transactions")
+    revalidatePath("/approvals")
+
+    return { success: true }
+  } catch (error) {
+    console.error("[rejectTransaction] error:", error)
+    return { success: false, error: "Failed to reject transaction." }
+  }
+}
+
+// ── reimburseTransactions ─────────────────────────────────────
+
+export async function reimburseTransactions(ids: string[]): Promise<ActionResult> {
+  try {
+    const user = await requireAuth()
+
+    if (user.role !== "FINANCE") {
+      return { success: false, error: "Forbidden: Only finance users can mark reimbursements." }
+    }
+
+    if (!ids.length) {
+      return { success: false, error: "No transactions selected." }
+    }
+
+    await prisma.transaction.updateMany({
+      where: {
+        id: { in: ids },
+        status: "APPROVED",
+        isDeleted: false
+      },
+      data: {
+        status: "REIMBURSED",
+        reimbursedAt: new Date()
+      }
+    })
+
+    audit(user.id, "transaction.bulk_reimbursed", "bulk", "transaction", undefined, { ids })
+
+    revalidatePath("/transactions")
+    revalidatePath("/finance")
+
+    return { success: true }
+  } catch (error) {
+    console.error("[reimburseTransactions] error:", error)
+    return { success: false, error: "Failed to process reimbursements." }
+  }
 }

@@ -57,6 +57,20 @@ export const createTransactionBaseSchema = z.object({
   transactionDate:    dateField,
   tags:               z.array(z.string().max(30)).max(10).default([]),
   transferToAccountId: z.string().nullable().optional(),
+
+  // Receipt and Workflow status
+  receiptUrl:          z.string().nullable().optional(),
+  receiptMimeType:     z.string().nullable().optional(),
+  status:              z.enum(["DRAFT", "PENDING", "APPROVED", "REJECTED", "REIMBURSED"]).optional(),
+  submitForApproval:   z.boolean().optional(),
+
+  // AI Audit fields
+  aiRawVendor:         z.string().nullable().optional(),
+  aiRawAmount:         z.coerce.number().nullable().optional(),
+  aiRawDate:           z.string().nullable().optional(),
+  aiRawCategory:       z.string().nullable().optional(),
+  aiConfidence:        z.number().nullable().optional(),
+  aiExtractionRaw:     z.any().optional().nullable(),
 })
 
 export const createTransactionSchema = createTransactionBaseSchema

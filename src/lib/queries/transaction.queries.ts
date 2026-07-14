@@ -40,6 +40,8 @@ export interface SerializedTransaction {
   transferToAccountId: string | null
   createdAt:     string          // ISO string
   updatedAt:     string
+  rejectionReason?: string | null
+  reimbursedAt?:    string | null
 }
 
 export interface PaginatedTransactions {
@@ -119,6 +121,8 @@ export async function getTransactions(
     transferToAccountId: t.transferToAccountId,
     createdAt:           t.createdAt.toISOString(),
     updatedAt:           t.updatedAt.toISOString(),
+    rejectionReason:     t.rejectionReason ?? null,
+    reimbursedAt:        t.reimbursedAt ? t.reimbursedAt.toISOString() : null,
   }))
 
   return {

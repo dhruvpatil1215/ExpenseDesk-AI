@@ -214,6 +214,8 @@ model Transaction {
   // Approval workflow — server-controlled only
   status          TransactionStatus @default(APPROVED)
   submittedAt     DateTime?
+  rejectionReason String?
+  reimbursedAt    DateTime?
 
   isRecurring     Boolean           @default(false)
   isDeleted       Boolean           @default(false)
