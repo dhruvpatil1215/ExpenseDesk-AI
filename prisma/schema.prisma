@@ -1,0 +1,360 @@
+// =============================================================
+// ExpenseDesk AI — Prisma Schema
+// Generated: 2026-07-09
+// Stack: Next.js 14 · TypeScript · Prisma · PostgreSQL
+// Plan assumption A4: all monetary amounts stored as BigInt
+//   (smallest currency unit — paise / cents)
+// =============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// =============================================================
+// ENUMS
+// =============================================================
+
+enum Role {
+  EMPLOYEE
+  MANAGER
+  FINANCE
+}
+
+enum AccountType {
+  CHECKING
+  SAVINGS
+  CREDIT
+  CASH
+  INVESTMENT
+  OTHER
+}
+
+enum CategoryType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+}
+
+/// Workflow state machine (plan section 6):
+/// DRAFT -> PENDING -> APPROVED -> REIMBURSED
+///                  \> REJECTED -> DRAFT (retract)
+enum TransactionStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  REIMBURSED
+}
+
+enum BudgetPeriod {
+  WEEKLY
+  MONTHLY
+  YEARLY
+  CUSTOM
+}
+
+enum GoalStatus {
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+enum NotificationType {
+  EXPENSE_SUBMITTED
+  EXPENSE_APPROVED
+  EXPENSE_REJECTED
+  EXPENSE_REIMBURSED
+  BUDGET_ALERT
+  BUDGET_EXCEEDED
+  GOAL_REACHED
+  GOAL_REMINDER
+  SYSTEM
+}
+
+// =============================================================
+// MODEL: User
+// SERVER fields: id, passwordHash, role, failedLoginCount,
+//   lockedUntil, emailVerified, emailVerifiedAt, createdAt, updatedAt
+// CLIENT fields: email, name, avatarUrl, currency
+// =============================================================
+
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique
+  name             String
+  passwordHash     String
+  role             Role      @default(EMPLOYEE)
+  avatarUrl        String?
+  currency         String    @default("INR")
+  isActive         Boolean   @default(true)
+  emailVerified    Boolean   @default(false)
+  emailVerifiedAt  DateTime?
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  accounts      Account[]
+  transactions  Transaction[]
+  budgets       Budget[]
+  goals         Goal[]
+  notifications Notification[]
+  activityLogs  ActivityLog[]
+  categories    Category[]
+
+  @@map("users")
+}
+
+// =============================================================
+// MODEL: Account
+// Financial account owned by a user.
+// balance stored in smallest currency unit (paise/cents).
+// =============================================================
+
+model Account {
+  id        String      @id @default(cuid())
+  userId    String
+  name      String
+  type      AccountType
+  balance   BigInt      @default(0)
+  currency  String      @default("INR")
+  color     String?
+  icon      String?
+  isActive  Boolean     @default(true)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions      Transaction[] @relation("AccountTransactions")
+  incomingTransfers Transaction[] @relation("TransferTarget")
+  goals             Goal[]
+
+  @@index([userId])
+  @@map("accounts")
+}
+
+// =============================================================
+// MODEL: Category
+// userId = NULL means system default (seeded at migration).
+// Custom user categories have userId set.
+// =============================================================
+
+model Category {
+  id        String       @id @default(cuid())
+  userId    String?
+  name      String
+  type      CategoryType
+  icon      String?
+  color     String?
+  isDefault Boolean      @default(false)
+  createdAt DateTime     @default(now())
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  budgets      Budget[]
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("categories")
+}
+
+// =============================================================
+// MODEL: Transaction
+// Central table for finance transactions AND expense approvals.
+//
+// NULLABLE FIELD FLAGS (fields that should be NOT NULL):
+//   categoryId      -- SHOULD BE REQUIRED; use "Uncategorized"
+//                      default category on delete instead of SET NULL
+//   receiptMimeType -- MUST be set whenever receiptUrl is set;
+//                      enforce at application layer
+//
+// AI field separation (plan section 5.2):
+//   aiRaw* fields are frozen at extraction (AI-SUGGESTED, audit only)
+//   vendor/amount/date/category are employee-confirmed (authoritative)
+// =============================================================
+
+model Transaction {
+  id              String          @id @default(cuid())
+  userId          String
+  accountId       String
+  categoryId      String?                              // NULLABLE: SHOULD BE REQUIRED
+  type            TransactionType
+  amount          BigInt
+  currency        String          @default("INR")
+  description     String
+  notes           String?
+  transactionDate DateTime        @db.Date
+  tags            String[]        @default([])
+
+  transferToAccountId String?
+
+  receiptUrl      String?
+  receiptHash     String?         @unique
+  receiptMimeType String?                              // NULLABLE: MUST be set with receiptUrl
+
+  // AI-SUGGESTED — immutable after initial extraction; never authoritative
+  aiRawVendor     String?
+  aiRawAmount     BigInt?
+  aiRawDate       DateTime?       @db.Date
+  aiRawCategory   String?
+  aiConfidence    Float?
+  aiExtractionRaw Json?
+
+  // Approval workflow — server-controlled only
+  status          TransactionStatus @default(APPROVED)
+  submittedAt     DateTime?
+
+  isRecurring     Boolean           @default(false)
+  isDeleted       Boolean           @default(false)
+  deletedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account           Account   @relation("AccountTransactions", fields: [accountId], references: [id], onDelete: Restrict)
+  category          Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  transferToAccount Account?  @relation("TransferTarget", fields: [transferToAccountId], references: [id], onDelete: Restrict)
+
+  @@index([userId, transactionDate(sort: Desc)])
+  @@index([userId, categoryId])
+  @@index([userId, accountId])
+  @@index([userId, status])
+  @@index([userId, type])
+  @@map("transactions")
+}
+
+// =============================================================
+// MODEL: Budget
+// One active budget per (user, category, periodStart).
+// Spent amount computed at query time from transactions.
+//
+// NULLABLE FIELD FLAGS:
+//   name -- SHOULD BE REQUIRED for user-facing identification
+// =============================================================
+
+model Budget {
+  id             String       @id @default(cuid())
+  userId         String
+  categoryId     String
+  name           String?                              // NULLABLE: SHOULD BE REQUIRED
+  limitAmount    BigInt
+  period         BudgetPeriod
+  periodStart    DateTime     @db.Date
+  periodEnd      DateTime     @db.Date
+  rollover       Boolean      @default(false)
+  alertAtPercent Int          @default(80)
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, categoryId, periodStart])
+  @@index([userId])
+  @@index([userId, isActive])
+  @@map("budgets")
+}
+
+// =============================================================
+// MODEL: Goal
+// Savings goals with optional account linkage.
+// currentAmount updated by contribution events.
+//
+// NULLABLE FIELD FLAGS:
+//   targetDate -- SHOULD BE REQUIRED; projections impossible without it
+//   accountId  -- SHOULD BE REQUIRED if account-balance tracking is in scope
+// =============================================================
+
+model Goal {
+  id            String     @id @default(cuid())
+  userId        String
+  accountId     String?                              // NULLABLE: SHOULD BE REQUIRED
+  name          String
+  description   String?
+  targetAmount  BigInt
+  currentAmount BigInt     @default(0)
+  targetDate    DateTime?  @db.Date                 // NULLABLE: SHOULD BE REQUIRED
+  icon          String?
+  color         String?
+  status        GoalStatus @default(ACTIVE)
+  completedAt   DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([userId, status])
+  @@map("goals")
+}
+
+// =============================================================
+// MODEL: Notification
+// In-app notifications only for MVP.
+//
+// NULLABLE FIELD FLAGS:
+//   entityId -- logically always paired with entityType;
+//               both should be set or both null (enforce at app layer)
+// =============================================================
+
+model Notification {
+  id         String           @id @default(cuid())
+  userId     String
+  type       NotificationType
+  title      String
+  message    String
+  entityType String?
+  entityId   String?                               // NULLABLE: SHOULD ALWAYS be set with entityType
+  isRead     Boolean          @default(false)
+  readAt     DateTime?
+  createdAt  DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, isRead])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
+
+// =============================================================
+// MODEL: ActivityLog
+// Immutable audit trail — insert-only, never updated.
+// userId is nullable for system-initiated actions.
+// =============================================================
+
+model ActivityLog {
+  id           String   @id @default(cuid())
+  userId       String?
+  action       String
+  resourceType String?
+  resourceId   String?
+  oldValues    Json?
+  newValues    Json?
+  ipAddress    String?
+  userAgent    String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([resourceType, resourceId])
+  @@index([action])
+  @@index([createdAt(sort: Desc)])
+  @@map("activity_logs")
+}
